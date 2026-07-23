@@ -59,148 +59,152 @@ monitorEvents.on('trade', (trade) => {
 // ─── API Routes ────────────────────────────────────────────────
 
 // --- Tracked Wallets ---
-app.get('/api/wallets', (req, res) => {
-  const wallets = db.prepare('SELECT * FROM tracked_wallets ORDER BY created_at DESC').all();
-  res.json(wallets);
-});
-
-app.post('/api/wallets', (req, res) => {
-  const { address, label } = req.body;
-  if (!address) return res.status(400).json({ error: 'address required' });
-
+app.get('/api/wallets', async (req, res) => {
   try {
-    const stmt = db.prepare('INSERT OR IGNORE INTO tracked_wallets (address, label) VALUES (?, ?)');
-    const result = stmt.run(address.trim(), label || '');
-    if (result.changes === 0) {
-      return res.status(409).json({ error: 'Wallet already tracked' });
-    }
-    res.json({ id: result.lastInsertRowid, address: address.trim(), label: label || '' });
+    const wallets = await db.prepare('SELECT * FROM tracked_wallets ORDER BY created_at DESC').all();
+    res.json(wallets);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-app.delete('/api/wallets/:id', (req, res) => {
-  db.prepare('DELETE FROM tracked_wallets WHERE id = ?').run(req.params.id);
+app.post('/api/wallets', async (req, res) => {
+  const { address, label } = req.body;
+  if (!address) return res.status(400).json({ error: 'address required' });
+
+  try {
+    const result = await db.prepare('INSERT INTO tracked_wallets (address, label) VALUES ($1, $2) ON CONFLICT (address) DO NOTHING').run(address.trim(), label || '');
+    if (result.changes === 0) {
+      return res.status(409).json({ error: 'Wallet already tracked' });
+    }
+    res.json({ address: address.trim(), label: label || '' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/wallets/:id', async (req, res) => {
+  await db.prepare('DELETE FROM tracked_wallets WHERE id = $1').run(req.params.id);
   res.json({ ok: true });
 });
 
-app.patch('/api/wallets/:id', (req, res) => {
+app.patch('/api/wallets/:id', async (req, res) => {
   const { label, active } = req.body;
   const updates = [];
   const values = [];
-  if (label !== undefined) { updates.push('label = ?'); values.push(label); }
-  if (active !== undefined) { updates.push('active = ?'); values.push(active ? 1 : 0); }
+  let idx = 1;
+  if (label !== undefined) { updates.push(`label = $${idx++}`); values.push(label); }
+  if (active !== undefined) { updates.push(`active = $${idx++}`); values.push(active ? 1 : 0); }
   if (updates.length === 0) return res.status(400).json({ error: 'nothing to update' });
   values.push(req.params.id);
-  db.prepare(`UPDATE tracked_wallets SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+  await db.prepare(`UPDATE tracked_wallets SET ${updates.join(', ')} WHERE id = $${idx}`).run(...values);
   res.json({ ok: true });
 });
 
 // --- Trades ---
-app.get('/api/trades', (req, res) => {
+app.get('/api/trades', async (req, res) => {
   const { wallet, token, dex, limit = 100, offset = 0 } = req.query;
   let sql = 'SELECT * FROM trades WHERE 1=1';
   const params = [];
+  let idx = 1;
 
-  if (wallet) { sql += ' AND wallet_address = ?'; params.push(wallet); }
-  if (token) { sql += ' AND token_address = ?'; params.push(token); }
-  if (dex) { sql += ' AND dex = ?'; params.push(dex); }
+  if (wallet) { sql += ` AND wallet_address = $${idx++}`; params.push(wallet); }
+  if (token) { sql += ` AND token_address = $${idx++}`; params.push(token); }
+  if (dex) { sql += ` AND dex = $${idx++}`; params.push(dex); }
 
-  sql += ' ORDER BY detected_at DESC LIMIT ? OFFSET ?';
+  sql += ` ORDER BY detected_at DESC LIMIT $${idx++} OFFSET $${idx++}`;
   params.push(parseInt(limit), parseInt(offset));
 
-  const trades = db.prepare(sql).all(...params);
+  const trades = await db.prepare(sql).all(...params);
   res.json(trades);
 });
 
 // --- Paper Positions ---
-app.get('/api/positions', (req, res) => {
+app.get('/api/positions', async (req, res) => {
   const { status, wallet, limit = 100 } = req.query;
   let sql = 'SELECT * FROM paper_positions WHERE 1=1';
   const params = [];
+  let idx = 1;
 
-  if (status) { sql += ' AND status = ?'; params.push(status.toUpperCase()); }
-  if (wallet) { sql += ' AND wallet_address = ?'; params.push(wallet); }
+  if (status) { sql += ` AND status = $${idx++}`; params.push(status.toUpperCase()); }
+  if (wallet) { sql += ` AND wallet_address = $${idx++}`; params.push(wallet); }
 
-  sql += ' ORDER BY created_at DESC LIMIT ?';
+  sql += ` ORDER BY created_at DESC LIMIT $${idx++}`;
   params.push(parseInt(limit));
 
-  const positions = db.prepare(sql).all(...params);
+  const positions = await db.prepare(sql).all(...params);
   res.json(positions);
 });
 
 // --- Stats ---
-app.get('/api/stats', (req, res) => {
-  const totalTrades = db.prepare('SELECT COUNT(*) as count FROM trades').get().count;
-  const totalBuys = db.prepare("SELECT COUNT(*) as count FROM trades WHERE action = 'BUY'").get().count;
-  const totalSells = db.prepare("SELECT COUNT(*) as count FROM trades WHERE action = 'SELL'").get().count;
+app.get('/api/stats', async (req, res) => {
+  try {
+    const totalTrades = (await db.prepare('SELECT COUNT(*) as count FROM trades').get()).count;
+    const totalBuys = (await db.prepare("SELECT COUNT(*) as count FROM trades WHERE action = 'BUY'").get()).count;
+    const totalSells = (await db.prepare("SELECT COUNT(*) as count FROM trades WHERE action = 'SELL'").get()).count;
 
-  const openPositions = db.prepare("SELECT COUNT(*) as count FROM paper_positions WHERE status = 'OPEN'").get().count;
-  const closedPositions = db.prepare("SELECT COUNT(*) as count FROM paper_positions WHERE status = 'CLOSED'").get().count;
+    const openPositions = (await db.prepare("SELECT COUNT(*) as count FROM paper_positions WHERE status = 'OPEN'").get()).count;
+    const closedPositions = (await db.prepare("SELECT COUNT(*) as count FROM paper_positions WHERE status = 'CLOSED'").get()).count;
 
-  const pnlStats = db.prepare(`
-    SELECT
-      COALESCE(SUM(pnl_sol), 0) as total_pnl,
-      COALESCE(AVG(pnl_percent), 0) as avg_pnl_percent,
-      COUNT(CASE WHEN pnl_sol > 0 THEN 1 END) as winning_trades,
-      COUNT(CASE WHEN pnl_sol < 0 THEN 1 END) as losing_trades,
-      COALESCE(MAX(pnl_sol), 0) as best_trade,
-      COALESCE(MIN(pnl_sol), 0) as worst_trade
-    FROM paper_positions WHERE status = 'CLOSED'
-  `).get();
+    const pnlStats = await db.prepare(`
+      SELECT
+        COALESCE(SUM(pnl_sol), 0) as total_pnl,
+        COALESCE(AVG(pnl_percent), 0) as avg_pnl_percent,
+        COUNT(CASE WHEN pnl_sol > 0 THEN 1 END) as winning_trades,
+        COUNT(CASE WHEN pnl_sol < 0 THEN 1 END) as losing_trades,
+        COALESCE(MAX(pnl_sol), 0) as best_trade,
+        COALESCE(MIN(pnl_sol), 0) as worst_trade
+      FROM paper_positions WHERE status = 'CLOSED'
+    `).get();
 
-  const winRate = closedPositions > 0 ? (pnlStats.winning_trades / closedPositions) * 100 : 0;
+    const winRate = closedPositions > 0 ? (pnlStats.winning_trades / closedPositions) * 100 : 0;
 
-  const walletStats = db.prepare(`
-    SELECT
-      wallet_address,
-      COUNT(*) as total_trades,
-      COUNT(CASE WHEN pnl_sol > 0 THEN 1 END) as wins,
-      COUNT(CASE WHEN pnl_sol < 0 THEN 1 END) as losses,
-      COALESCE(SUM(pnl_sol), 0) as total_pnl,
-      COALESCE(AVG(pnl_percent), 0) as avg_pnl_percent
-    FROM paper_positions
-    WHERE status = 'CLOSED'
-    GROUP BY wallet_address
-    ORDER BY total_pnl DESC
-  `).all();
+    const walletStats = await db.prepare(`
+      SELECT
+        wallet_address,
+        COUNT(*) as total_trades,
+        COUNT(CASE WHEN pnl_sol > 0 THEN 1 END) as wins,
+        COUNT(CASE WHEN pnl_sol < 0 THEN 1 END) as losses,
+        COALESCE(SUM(pnl_sol), 0) as total_pnl,
+        COALESCE(AVG(pnl_percent), 0) as avg_pnl_percent
+      FROM paper_positions
+      WHERE status = 'CLOSED'
+      GROUP BY wallet_address
+      ORDER BY total_pnl DESC
+    `).all();
 
-  const topTokens = db.prepare(`
-    SELECT
-      token_symbol,
-      token_address,
-      COUNT(*) as trade_count,
-      COALESCE(SUM(pnl_sol), 0) as total_pnl,
-      COALESCE(AVG(pnl_percent), 0) as avg_pnl_percent
-    FROM paper_positions
-    WHERE status = 'CLOSED'
-    GROUP BY token_address
-    ORDER BY total_pnl DESC
-    LIMIT 10
-  `).all();
+    const topTokens = await db.prepare(`
+      SELECT
+        token_symbol,
+        token_address,
+        COUNT(*) as trade_count,
+        COALESCE(SUM(pnl_sol), 0) as total_pnl,
+        COALESCE(AVG(pnl_percent), 0) as avg_pnl_percent
+      FROM paper_positions
+      WHERE status = 'CLOSED'
+      GROUP BY token_address, token_symbol
+      ORDER BY total_pnl DESC
+      LIMIT 10
+    `).all();
 
-  res.json({
-    overview: {
-      totalTrades,
-      totalBuys,
-      totalSells,
-      openPositions,
-      closedPositions,
-    },
-    performance: {
-      totalPnl: pnlStats.total_pnl,
-      avgPnlPercent: pnlStats.avg_pnl_percent,
-      winRate,
-      winningTrades: pnlStats.winning_trades,
-      losingTrades: pnlStats.losing_trades,
-      bestTrade: pnlStats.best_trade,
-      worstTrade: pnlStats.worst_trade,
-    },
-    walletStats,
-    topTokens,
-    monitor: getMonitorStatus(),
-  });
+    res.json({
+      overview: { totalTrades, totalBuys, totalSells, openPositions, closedPositions },
+      performance: {
+        totalPnl: pnlStats.total_pnl,
+        avgPnlPercent: pnlStats.avg_pnl_percent,
+        winRate,
+        winningTrades: pnlStats.winning_trades,
+        losingTrades: pnlStats.losing_trades,
+        bestTrade: pnlStats.best_trade,
+        worstTrade: pnlStats.worst_trade,
+      },
+      walletStats,
+      topTokens,
+      monitor: getMonitorStatus(),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // --- Monitor Control ---
@@ -223,7 +227,7 @@ app.get('/api/settings', (req, res) => {
   res.json({
     hasApiKey: gmgnKeys.length > 0,
     keyCount: gmgnKeys.length,
-    pollInterval: parseInt(process.env.POLL_INTERVAL_MS) || 5000,
+    pollInterval: parseInt(process.env.POLL_INTERVAL_MS) || 3000,
     defaultPositionSol: parseFloat(process.env.DEFAULT_POSITION_SOL) || 1.0,
     stopLoss: parseInt(process.env.STOP_LOSS_PERCENT) || 50,
     takeProfit: parseInt(process.env.TAKE_PROFIT_PERCENT) || 500,
@@ -232,10 +236,10 @@ app.get('/api/settings', (req, res) => {
 });
 
 // --- Clear All Data ---
-app.post('/api/clear', (req, res) => {
-  db.prepare('DELETE FROM trades').run();
-  db.prepare('DELETE FROM paper_positions').run();
-  db.prepare('DELETE FROM tracked_wallets').run();
+app.post('/api/clear', async (req, res) => {
+  await db.prepare('DELETE FROM trades').run();
+  await db.prepare('DELETE FROM paper_positions').run();
+  await db.prepare('DELETE FROM tracked_wallets').run();
   res.json({ ok: true });
 });
 
@@ -305,16 +309,15 @@ app.get('/api/gmgn/signals', async (req, res) => {
 });
 
 // --- Seed demo data ---
-app.post('/api/demo/seed', (req, res) => {
+app.post('/api/demo/seed', async (req, res) => {
   const demoWallets = [
     { address: '7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU', label: 'Whale #1' },
     { address: '9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM', label: 'Smart Money #2' },
     { address: '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1', label: 'Degen Trader #3' },
   ];
 
-  const insertWallet = db.prepare('INSERT OR IGNORE INTO tracked_wallets (address, label) VALUES (?, ?)');
   for (const w of demoWallets) {
-    insertWallet.run(w.address, w.label);
+    await db.prepare('INSERT INTO tracked_wallets (address, label) VALUES ($1, $2) ON CONFLICT (address) DO NOTHING').run(w.address, w.label);
   }
 
   const demoTokens = [
@@ -325,16 +328,6 @@ app.post('/api/demo/seed', (req, res) => {
     { symbol: 'GUMMY', name: 'GUMMY', address: 'GUMMYbJNd1qi4EuiRdx8sW6a2YdWJHQjwjN8MFqZT54G', dex: 'pump.fun' },
     { symbol: 'MYRO', name: 'Myro', address: 'HhJpBhRRn4g56VsyLuT8DL5Bv31HkXqsrahTTUCZeZg4', dex: 'jupiter' },
   ];
-
-  const insertTrade = db.prepare(`
-    INSERT INTO trades (wallet_address, token_address, token_symbol, token_name, action, amount_sol, amount_tokens, price_sol, detected_at, tx_signature, dex)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  const insertPosition = db.prepare(`
-    INSERT INTO paper_positions (wallet_address, token_address, token_symbol, buy_price_sol, buy_amount_sol, buy_amount_tokens, buy_time, sell_price_sol, sell_amount_sol, sell_time, pnl_sol, pnl_percent, status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
 
   const now = Date.now();
   let sigCounter = 0;
@@ -350,10 +343,10 @@ app.post('/api/demo/seed', (req, res) => {
     sigCounter++;
     const sig = `demo_sig_${sigCounter}_${Date.now()}`;
 
-    insertTrade.run(
-      wallet.address, token.address, token.symbol, token.name, 'BUY',
-      buyAmountSol, buyAmountTokens, buyPrice, buyTime, sig, token.dex
-    );
+    await db.prepare(`
+      INSERT INTO trades (wallet_address, token_address, token_symbol, token_name, action, amount_sol, amount_tokens, price_sol, detected_at, tx_signature, dex)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    `).run(wallet.address, token.address, token.symbol, token.name, 'BUY', buyAmountSol, buyAmountTokens, buyPrice, buyTime, sig, token.dex);
 
     if (Math.random() > 0.3) {
       const pnlMult = Math.random() > 0.35 ? (1 + Math.random() * 8) : (0.1 + Math.random() * 0.6);
@@ -367,95 +360,90 @@ app.post('/api/demo/seed', (req, res) => {
       sigCounter++;
       const sellSig = `demo_sig_${sigCounter}_${Date.now()}`;
 
-      insertTrade.run(
-        wallet.address, token.address, token.symbol, token.name, 'SELL',
-        sellAmountSol, sellAmountTokens, sellPrice, sellTime, sellSig, token.dex
-      );
+      await db.prepare(`
+        INSERT INTO trades (wallet_address, token_address, token_symbol, token_name, action, amount_sol, amount_tokens, price_sol, detected_at, tx_signature, dex)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      `).run(wallet.address, token.address, token.symbol, token.name, 'SELL', sellAmountSol, sellAmountTokens, sellPrice, sellTime, sellSig, token.dex);
 
-      insertPosition.run(
-        wallet.address, token.address, token.symbol,
-        buyPrice, buyAmountSol, buyAmountTokens, buyTime,
-        sellPrice, sellAmountSol, sellTime,
-        pnlSol, pnlPercent, 'CLOSED'
-      );
+      await db.prepare(`
+        INSERT INTO paper_positions (wallet_address, token_address, token_symbol, buy_price_sol, buy_amount_sol, buy_amount_tokens, buy_time, sell_price_sol, sell_amount_sol, sell_time, pnl_sol, pnl_percent, status)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+      `).run(wallet.address, token.address, token.symbol, buyPrice, buyAmountSol, buyAmountTokens, buyTime, sellPrice, sellAmountSol, sellTime, pnlSol, pnlPercent, 'CLOSED');
     } else {
-      insertPosition.run(
-        wallet.address, token.address, token.symbol,
-        buyPrice, buyAmountSol, buyAmountTokens, buyTime,
-        null, null, null, null, null, 'OPEN'
-      );
+      await db.prepare(`
+        INSERT INTO paper_positions (wallet_address, token_address, token_symbol, buy_price_sol, buy_amount_sol, buy_amount_tokens, buy_time, status)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'OPEN')
+      `).run(wallet.address, token.address, token.symbol, buyPrice, buyAmountSol, buyAmountTokens, buyTime);
     }
   }
 
   res.json({ ok: true, message: 'Demo data seeded', wallets: demoWallets.length, trades: 40 });
 });
 
+// ─── Auto-seed wallets if DB empty ─────────────────────────────
+async function seedWalletsIfEmpty() {
+  try {
+    const count = (await db.prepare('SELECT COUNT(*) as c FROM tracked_wallets').get()).c;
+    if (count > 0) return;
+
+    const wallets = [
+      'CQKJHYqVPn8P944dpQtNud5eVLQr4p8iFuKSVNgKYNxY',
+      '7szNtB9WXHpUdyGiBvMRaYouBBTsL2QbTtYrig8wo2vP',
+      'ETktiJxhUaSygocMgTKf3SEkmtfj6RwXCtZowxtCm2HT',
+      'EW1BMaF3AUnu9anjUmu8p3EY5F33ZhMESi7V2DJHNgNw',
+      'FFEjC9MHhpQViBPrD2iU6LmV2hEigyhLJaL7MZUZzyD4',
+      'Bz429AezLuxgftrYKGCaTJsjZBN6LibmYp9eVfL9MXZ9',
+      '8FiuwM6FmVKmBLCaJ6QcNScnVw4NuNs7Tt4Skf91saF8',
+      '843VNwYH83tgpBfrZxkxQQWfQ8CRdsLBmzhcT4JGjHBs',
+      'HQxk62unB6CHhv5aLydMXmHUvcgKnNBifkTUjVaetp9k',
+      '3nG9zBc6fTne3j9kkS1CB5quyt25CS29GEjvMGNKmDSz',
+      'Gghj6515zeefxS2Dv7vwSSGyWqtASJFojuLwVMFsc6FN',
+      'BbAP8535rUsmpNBc6cjyp2oxj9KQGpn9YHT5BJkG1HCE',
+      'H4K5LjkjXVRBsQXJig3xq9L6co6SfoqRiqnih5iohX9A',
+      'THXcGyTMLSKWmvpDpdgL8G224xfMXksCfA29LBoJfUJ',
+      'BRDG6WL3UzDGKgaz6jxrvsrSXDsqhKNFy9bfHparH435',
+      '5HcCtAXoQC2Egr94sDDTbp4GXhHxro2a8PCXBXJuKVuR',
+      'FTaSBuVj6w2S7XUa8fw19xrLy57DDr6kZDL6sxDXtvTP',
+      '6Ej4esUAys7hkxUQp7fuZQxeroNinfcrDe8jbbUic3Zq',
+      'HF2EGxkKXRhdR93ZN5fY925PpecZDwRfKwhag6mvFMLW',
+      '9fpUmh3Tv3UCdeHLyq3o4QhkTBu5XAbEiKP9FtGaSndb',
+      'Ftt7rRKHPDAhgm6KPfShiMPmDvnJjbVd5ehd3Ju4GMrD',
+      'DwWuSoFa1gtNPbDxMRpDnQy7KnaLqBqDA9cHqM3TnsLw',
+      'FskgHQ5a3H7cMLjkfAtzyb2UboQbF5iBx6qxTGWUqjF5',
+      'DDMWe6qoo1dYkCBkaPAXXancTu9Na9wKb9UmjXTLZezX',
+      '8zLw4WyAeZbYEDJTP3H48pa927cSQ46ymDH4LVr6tfM7',
+      '26kePvYeMNuoApxhe3cTDPEJK8LxC6Lrin4yK8FQzKEM',
+      '6117oRzduSQUYNmVGDAxRs3gFj7krtcTD2xC3SFaGuS8',
+      'BmXugVGYfGMj9QRLkdcEGijGgWo4X558tV1QR6ih2eE4',
+      '9xHqBH1FtbN1T57u6RSZDn6ykkJzDjNMJe9M1jN7j8NQ',
+      '9ryBR3SnxgGPhWsKvsfxuNHUCTt6tSpLe8wrKCShXLaq',
+    ];
+
+    for (const w of wallets) {
+      await db.prepare('INSERT INTO tracked_wallets (address, label) VALUES ($1, $2) ON CONFLICT (address) DO NOTHING').run(w, '');
+    }
+    console.log(`Auto-seeded ${wallets.length} wallets`);
+  } catch (e) {
+    console.error('Wallet seed error:', e.message);
+  }
+}
+
 // ─── Start Server ──────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 
-// Auto-seed wallets if database is empty
-function seedWalletsIfEmpty() {
-  const count = db.prepare('SELECT COUNT(*) as c FROM tracked_wallets').get().c;
-  if (count > 0) return;
+server.listen(PORT, '0.0.0.0', async () => {
+  console.log(`\n🚀 Memecoin Paper Trading Dashboard — GMGN Edition`);
+  console.log(`   http://localhost:${PORT}`);
+  console.log(`   API: http://localhost:${PORT}/api/stats`);
+  console.log('');
 
-  const wallets = [
-    'CQKJHYqVPn8P944dpQtNud5eVLQr4p8iFuKSVNgKYNxY',
-    '7szNtB9WXHpUdyGiBvMRaYouBBTsL2QbTtYrig8wo2vP',
-    'ETktiJxhUaSygocMgTKf3SEkmtfj6RwXCtZowxtCm2HT',
-    'EW1BMaF3AUnu9anjUmu8p3EY5F33ZhMESi7V2DJHNgNw',
-    'FFEjC9MHhpQViBPrD2iU6LmV2hEigyhLJaL7MZUZzyD4',
-    'Bz429AezLuxgftrYKGCaTJsjZBN6LibmYp9eVfL9MXZ9',
-    '8FiuwM6FmVKmBLCaJ6QcNScnVw4NuNs7Tt4Skf91saF8',
-    '843VNwYH83tgpBfrZxkxQQWfQ8CRdsLBmzhcT4JGjHBs',
-    'HQxk62unB6CHhv5aLydMXmHUvcgKnNBifkTUjVaetp9k',
-    '3nG9zBc6fTne3j9kkS1CB5quyt25CS29GEjvMGNKmDSz',
-    'Gghj6515zeefxS2Dv7vwSSGyWqtASJFojuLwVMFsc6FN',
-    'BbAP8535rUsmpNBc6cjyp2oxj9KQGpn9YHT5BJkG1HCE',
-    'H4K5LjkjXVRBsQXJig3xq9L6co6SfoqRiqnih5iohX9A',
-    'THXcGyTMLSKWmvpDpdgL8G224xfMXksCfA29LBoJfUJ',
-    'BRDG6WL3UzDGKgaz6jxrvsrSXDsqhKNFy9bfHparH435',
-    '5HcCtAXoQC2Egr94sDDTbp4GXhHxro2a8PCXBXJuKVuR',
-    'FTaSBuVj6w2S7XUa8fw19xrLy57DDr6kZDL6sxDXtvTP',
-    '6Ej4esUAys7hkxUQp7fuZQxeroNinfcrDe8jbbUic3Zq',
-    'HF2EGxkKXRhdR93ZN5fY925PpecZDwRfKwhag6mvFMLW',
-    '9fpUmh3Tv3UCdeHLyq3o4QhkTBu5XAbEiKP9FtGaSndb',
-    'Ftt7rRKHPDAhgm6KPfShiMPmDvnJjbVd5ehd3Ju4GMrD',
-    'DwWuSoFa1gtNPbDxMRpDnQy7KnaLqBqDA9cHqM3TnsLw',
-    'FskgHQ5a3H7cMLjkfAtzyb2UboQbF5iBx6qxTGWUqjF5',
-    'DDMWe6qoo1dYkCBkaPAXXancTu9Na9wKb9UmjXTLZezX',
-    '8zLw4WyAeZbYEDJTP3H48pa927cSQ46ymDH4LVr6tfM7',
-    '26kePvYeMNuoApxhe3cTDPEJK8LxC6Lrin4yK8FQzKEM',
-    '6117oRzduSQUYNmVGDAxRs3gFj7krtcTD2xC3SFaGuS8',
-    'BmXugVGYfGMj9QRLkdcEGijGgWo4X558tV1QR6ih2eE4',
-    '9xHqBH1FtbN1T57u6RSZDn6ykkJzDjNMJe9M1jN7j8NQ',
-    '9ryBR3SnxgGPhWsKvsfxuNHUCTt6tSpLe8wrKCShXLaq',
-  ];
+  await seedWalletsIfEmpty();
 
-  const stmt = db.prepare('INSERT OR IGNORE INTO tracked_wallets (address, label) VALUES (?, ?)');
-  for (const w of wallets) {
-    stmt.run(w, '');
+  if (gmgnKeys.length > 0) {
+    startMonitor();
+  } else {
+    console.log('⚠️  No GMGN_API_KEYS set.');
+    console.log('   Add GMGN_API_KEYS in Railway Environment Variables.');
+    console.log('   Get keys at https://gmgn.ai/ai\n');
   }
-  console.log(`Auto-seeded ${wallets.length} wallets`);
-}
-
-seedWalletsIfEmpty();
-
-server.listen(PORT, '0.0.0.0', () => {
-    console.log(`\n🚀 Memecoin Paper Trading Dashboard — GMGN Edition`);
-    console.log(`   http://localhost:${PORT}`);
-    console.log(`   API: http://localhost:${PORT}/api/stats`);
-    console.log('');
-
-    if (gmgnKeys.length > 0) {
-      startMonitor();
-    } else {
-      console.log('⚠️  No GMGN_API_KEYS set.');
-      console.log('   Add GMGN_API_KEYS in Railway Environment Variables.');
-      console.log('   Get keys at https://gmgn.ai/ai');
-      console.log('   Dashboard running in demo mode.\n');
-    }
-  });
-} catch (err) {
-  console.error('Failed to start server:', err);
-  process.exit(1);
-}
+});

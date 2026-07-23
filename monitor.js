@@ -21,7 +21,6 @@ const gmgn = new GmgnClient(gmgnKeys);
 const lastSeenTx = new Map();
 
 // ── Rate Limiter ──────────────────────────────────────────────
-// GMGN: capacity=20, rate=20 tokens/sec, wallet_activity weight=3
 const bucket = { tokens: 20, lastRefill: Date.now(), capacity: 20, rate: 20 };
 
 async function waitForToken(weight = 3) {
@@ -34,7 +33,6 @@ async function waitForToken(weight = 3) {
     bucket.tokens -= weight;
     return;
   }
-  // Wait for enough tokens to refill
   const waitMs = ((weight - bucket.tokens) / bucket.rate) * 1000 + 50;
   await new Promise(r => setTimeout(r, waitMs));
   bucket.tokens = 0;
@@ -42,7 +40,7 @@ async function waitForToken(weight = 3) {
 
 // ── Fetch ─────────────────────────────────────────────────────
 async function fetchWalletActivity(walletAddress, limit = 20) {
-  if (gmgnKeys.length === 0) throw new Error('GMGN_API_KEY not set');
+  if (gmgnKeys.length === 0) throw new Error('GMGN_API_KEYS not set');
   return gmgn.getWalletActivity(walletAddress, { limit });
 }
 
@@ -114,30 +112,29 @@ async function handleTrade(trade) {
   if (!trade.walletAddress) return null;
   await enrichWithSolPrice(trade);
 
-  const stmt = db.prepare(`
+  await db.prepare(`
     INSERT INTO trades (wallet_address, token_address, token_symbol, token_name, action, amount_sol, amount_tokens, price_sol, detected_at, tx_signature, dex, raw_data)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  stmt.run(
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+  `).run(
     trade.walletAddress, trade.tokenAddress, trade.tokenSymbol, trade.tokenName,
     trade.type, trade.amountSol, trade.amountTokens, trade.priceSol,
     trade.timestamp, trade.signature, trade.dex || 'unknown', JSON.stringify(trade.rawData)
   );
 
   if (trade.type === 'BUY') {
-    db.prepare(`INSERT INTO paper_positions (wallet_address, token_address, token_symbol, buy_price_sol, buy_amount_sol, buy_amount_tokens, buy_time, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN')`)
+    await db.prepare(`INSERT INTO paper_positions (wallet_address, token_address, token_symbol, buy_price_sol, buy_amount_sol, buy_amount_tokens, buy_time, status) VALUES ($1, $2, $3, $4, $5, $6, $7, 'OPEN')`)
       .run(trade.walletAddress, trade.tokenAddress, trade.tokenSymbol, trade.priceSol, trade.amountSol, trade.amountTokens, trade.timestamp);
     const dexTag = trade.dex !== 'unknown' ? ` [${trade.dex}]` : '';
     console.log(`📈 BUY: ${trade.tokenSymbol}${dexTag} @ ${trade.priceSol.toFixed(12)} SOL (${trade.amountSol.toFixed(4)} SOL) from ${trade.walletAddress.slice(0, 6)}...`);
   }
 
   if (trade.type === 'SELL') {
-    const position = db.prepare(`SELECT * FROM paper_positions WHERE wallet_address = ? AND token_address = ? AND status = 'OPEN' ORDER BY buy_time ASC LIMIT 1`)
+    const position = await db.prepare(`SELECT * FROM paper_positions WHERE wallet_address = $1 AND token_address = $2 AND status = 'OPEN' ORDER BY buy_time ASC LIMIT 1`)
       .get(trade.walletAddress, trade.tokenAddress);
     if (position) {
       const pnlSol = trade.amountSol - position.buy_amount_sol;
       const pnlPercent = position.buy_price_sol > 0 ? ((trade.priceSol - position.buy_price_sol) / position.buy_price_sol) * 100 : 0;
-      db.prepare(`UPDATE paper_positions SET sell_price_sol = ?, sell_amount_sol = ?, sell_time = ?, pnl_sol = ?, pnl_percent = ?, status = 'CLOSED' WHERE id = ?`)
+      await db.prepare(`UPDATE paper_positions SET sell_price_sol = $1, sell_amount_sol = $2, sell_time = $3, pnl_sol = $4, pnl_percent = $5, status = 'CLOSED' WHERE id = $6`)
         .run(trade.priceSol, trade.amountSol, trade.timestamp, pnlSol, pnlPercent, position.id);
       const emoji = pnlSol >= 0 ? '💰' : '📉';
       const dexTag = trade.dex !== 'unknown' ? ` [${trade.dex}]` : '';
@@ -154,7 +151,7 @@ async function handleTrade(trade) {
 // ── Poll Wallet (with rate limiting) ──────────────────────────
 async function pollWallet(walletAddress) {
   try {
-    await waitForToken(3); // weight=3
+    await waitForToken(3);
 
     const result = await fetchWalletActivity(walletAddress, 20);
     const activities = result?.activities || [];
@@ -175,7 +172,6 @@ async function pollWallet(walletAddress) {
     }
   } catch (err) {
     if (err.message?.includes('429')) {
-      // Rate limited — back off
       bucket.tokens = 0;
       await new Promise(r => setTimeout(r, 5000));
     } else {
@@ -190,10 +186,9 @@ let isRunning = false;
 let pollIndex = 0;
 
 async function monitorTick() {
-  const wallets = db.prepare('SELECT address FROM tracked_wallets WHERE active = 1').all();
+  const wallets = await db.prepare('SELECT address FROM tracked_wallets WHERE active = 1').all();
   if (wallets.length === 0) return;
 
-  // Poll 6 wallets per tick (weight 3 × 6 = 18, under 20 capacity)
   const batchSize = 6;
   const start = pollIndex % wallets.length;
   const batch = [];
@@ -221,7 +216,7 @@ function startMonitor() {
 
   // Seed wallets with rate limiting
   (async () => {
-    const wallets = db.prepare('SELECT address FROM tracked_wallets WHERE active = 1').all();
+    const wallets = await db.prepare('SELECT address FROM tracked_wallets WHERE active = 1').all();
     console.log(`  Seeding ${wallets.length} wallets...`);
     for (const w of wallets) {
       try {
