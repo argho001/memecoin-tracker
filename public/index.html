@@ -1261,6 +1261,21 @@
   // ─── Init ──────────────────────────────────────────────────────
   connectWS();
   loadAll();
+
+  // Sync monitor button state on page load
+  async function syncMonitorState() {
+    try {
+      const status = await api('/monitor/status');
+      if (status.running) {
+        monitorRunning = true;
+        const btn = document.getElementById('monitor-btn');
+        btn.innerHTML = '<span id="monitor-icon">⏹</span> Stop';
+        btn.className = 'btn btn-sm btn-danger';
+      }
+    } catch (e) {}
+  }
+  syncMonitorState();
+
   setInterval(() => {
     loadStats();
     const active = document.querySelector('.tab-item.active')?.dataset.tab;
