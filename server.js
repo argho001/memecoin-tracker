@@ -393,8 +393,54 @@ app.post('/api/demo/seed', (req, res) => {
 // ─── Start Server ──────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 
-try {
-  server.listen(PORT, '0.0.0.0', () => {
+// Auto-seed wallets if database is empty
+function seedWalletsIfEmpty() {
+  const count = db.prepare('SELECT COUNT(*) as c FROM tracked_wallets').get().c;
+  if (count > 0) return;
+
+  const wallets = [
+    'CQKJHYqVPn8P944dpQtNud5eVLQr4p8iFuKSVNgKYNxY',
+    '7szNtB9WXHpUdyGiBvMRaYouBBTsL2QbTtYrig8wo2vP',
+    'ETktiJxhUaSygocMgTKf3SEkmtfj6RwXCtZowxtCm2HT',
+    'EW1BMaF3AUnu9anjUmu8p3EY5F33ZhMESi7V2DJHNgNw',
+    'FFEjC9MHhpQViBPrD2iU6LmV2hEigyhLJaL7MZUZzyD4',
+    'Bz429AezLuxgftrYKGCaTJsjZBN6LibmYp9eVfL9MXZ9',
+    '8FiuwM6FmVKmBLCaJ6QcNScnVw4NuNs7Tt4Skf91saF8',
+    '843VNwYH83tgpBfrZxkxQQWfQ8CRdsLBmzhcT4JGjHBs',
+    'HQxk62unB6CHhv5aLydMXmHUvcgKnNBifkTUjVaetp9k',
+    '3nG9zBc6fTne3j9kkS1CB5quyt25CS29GEjvMGNKmDSz',
+    'Gghj6515zeefxS2Dv7vwSSGyWqtASJFojuLwVMFsc6FN',
+    'BbAP8535rUsmpNBc6cjyp2oxj9KQGpn9YHT5BJkG1HCE',
+    'H4K5LjkjXVRBsQXJig3xq9L6co6SfoqRiqnih5iohX9A',
+    'THXcGyTMLSKWmvpDpdgL8G224xfMXksCfA29LBoJfUJ',
+    'BRDG6WL3UzDGKgaz6jxrvsrSXDsqhKNFy9bfHparH435',
+    '5HcCtAXoQC2Egr94sDDTbp4GXhHxro2a8PCXBXJuKVuR',
+    'FTaSBuVj6w2S7XUa8fw19xrLy57DDr6kZDL6sxDXtvTP',
+    '6Ej4esUAys7hkxUQp7fuZQxeroNinfcrDe8jbbUic3Zq',
+    'HF2EGxkKXRhdR93ZN5fY925PpecZDwRfKwhag6mvFMLW',
+    '9fpUmh3Tv3UCdeHLyq3o4QhkTBu5XAbEiKP9FtGaSndb',
+    'Ftt7rRKHPDAhgm6KPfShiMPmDvnJjbVd5ehd3Ju4GMrD',
+    'DwWuSoFa1gtNPbDxMRpDnQy7KnaLqBqDA9cHqM3TnsLw',
+    'FskgHQ5a3H7cMLjkfAtzyb2UboQbF5iBx6qxTGWUqjF5',
+    'DDMWe6qoo1dYkCBkaPAXXancTu9Na9wKb9UmjXTLZezX',
+    '8zLw4WyAeZbYEDJTP3H48pa927cSQ46ymDH4LVr6tfM7',
+    '26kePvYeMNuoApxhe3cTDPEJK8LxC6Lrin4yK8FQzKEM',
+    '6117oRzduSQUYNmVGDAxRs3gFj7krtcTD2xC3SFaGuS8',
+    'BmXugVGYfGMj9QRLkdcEGijGgWo4X558tV1QR6ih2eE4',
+    '9xHqBH1FtbN1T57u6RSZDn6ykkJzDjNMJe9M1jN7j8NQ',
+    '9ryBR3SnxgGPhWsKvsfxuNHUCTt6tSpLe8wrKCShXLaq',
+  ];
+
+  const stmt = db.prepare('INSERT OR IGNORE INTO tracked_wallets (address, label) VALUES (?, ?)');
+  for (const w of wallets) {
+    stmt.run(w, '');
+  }
+  console.log(`Auto-seeded ${wallets.length} wallets`);
+}
+
+seedWalletsIfEmpty();
+
+server.listen(PORT, '0.0.0.0', () => {
     console.log(`\n🚀 Memecoin Paper Trading Dashboard — GMGN Edition`);
     console.log(`   http://localhost:${PORT}`);
     console.log(`   API: http://localhost:${PORT}/api/stats`);
