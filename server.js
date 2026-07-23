@@ -393,18 +393,23 @@ app.post('/api/demo/seed', (req, res) => {
 // ─── Start Server ──────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n🚀 Memecoin Paper Trading Dashboard — GMGN Edition`);
-  console.log(`   http://localhost:${PORT}`);
-  console.log(`   API: http://localhost:${PORT}/api/stats`);
-  console.log('');
+try {
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`\n🚀 Memecoin Paper Trading Dashboard — GMGN Edition`);
+    console.log(`   http://localhost:${PORT}`);
+    console.log(`   API: http://localhost:${PORT}/api/stats`);
+    console.log('');
 
-  if (gmgnKeys.length > 0) {
-    startMonitor();
-  } else {
-    console.log('⚠️  No GMGN_API_KEY set.');
-    console.log('   Get your key at https://gmgn.ai/ai');
-    console.log('   Set it in .env as GMGN_API_KEY=your_key');
-    console.log('   Visit dashboard and click "Seed Demo Data" to explore.\n');
-  }
-});
+    if (gmgnKeys.length > 0) {
+      startMonitor();
+    } else {
+      console.log('⚠️  No GMGN_API_KEYS set.');
+      console.log('   Add GMGN_API_KEYS in Railway Environment Variables.');
+      console.log('   Get keys at https://gmgn.ai/ai');
+      console.log('   Dashboard running in demo mode.\n');
+    }
+  });
+} catch (err) {
+  console.error('Failed to start server:', err);
+  process.exit(1);
+}
