@@ -1,314 +1,190 @@
-const axios = require('axios');
+/**
+ * Wallet Monitor — GMGN Edition with Rate Limiter
+ *
+ * GMGN rate limit: leaky bucket, capacity=20, rate=20/sec
+ * wallet_activity weight=3 → max 6 calls per burst, then wait for refill
+ */
+
 const EventEmitter = require('events');
 const db = require('./db');
+const { GmgnClient } = require('./gmgn');
 
 const events = new EventEmitter();
 
-const HELIUS_API_KEY = process.env.HELIUS_API_KEY || '';
-const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL_MS) || 5000;
-const HELIUS_BASE = 'https://api.helius.xyz/v0';
+const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL_MS) || 3000;
+const GMGN_API_KEYS = process.env.GMGN_API_KEYS || process.env.GMGN_API_KEY || '';
+const gmgnKeys = GMGN_API_KEYS.split(',').map(k => k.trim()).filter(Boolean);
 
-// Track last seen tx per wallet to avoid duplicates
+const gmgn = new GmgnClient(gmgnKeys);
+
+// Track last seen activity per wallet
 const lastSeenTx = new Map();
 
-/**
- * Fetch recent transactions for a wallet via Helius Enhanced API
- */
-async function fetchWalletTransactions(walletAddress, limit = 10) {
-  if (!HELIUS_API_KEY) {
-    throw new Error('HELIUS_API_KEY not set');
-  }
+// ── Rate Limiter ──────────────────────────────────────────────
+// GMGN: capacity=20, rate=20 tokens/sec, wallet_activity weight=3
+const bucket = { tokens: 20, lastRefill: Date.now(), capacity: 20, rate: 20 };
 
-  const url = `${HELIUS_BASE}/addresses/${walletAddress}/transactions?api-key=${HELIUS_API_KEY}&limit=${limit}`;
-  const resp = await axios.get(url, { timeout: 10000 });
-  return resp.data || [];
+async function waitForToken(weight = 3) {
+  const now = Date.now();
+  const elapsed = (now - bucket.lastRefill) / 1000;
+  bucket.tokens = Math.min(bucket.capacity, bucket.tokens + elapsed * bucket.rate);
+  bucket.lastRefill = now;
+
+  if (bucket.tokens >= weight) {
+    bucket.tokens -= weight;
+    return;
+  }
+  // Wait for enough tokens to refill
+  const waitMs = ((weight - bucket.tokens) / bucket.rate) * 1000 + 50;
+  await new Promise(r => setTimeout(r, waitMs));
+  bucket.tokens = 0;
 }
 
-/**
- * Parse a Helius enhanced transaction to extract swap info
- */
-function parseSwapTransaction(tx, walletAddress) {
-  // Helius enhanced transactions have a 'type' field
-  // We look for SWAP type or token transfers that indicate a buy/sell
+// ── Fetch ─────────────────────────────────────────────────────
+async function fetchWalletActivity(walletAddress, limit = 20) {
+  if (gmgnKeys.length === 0) throw new Error('GMGN_API_KEY not set');
+  return gmgn.getWalletActivity(walletAddress, { limit });
+}
 
-  const result = {
-    signature: tx.signature,
-    timestamp: tx.timestamp ? new Date(tx.timestamp * 1000).toISOString() : new Date().toISOString(),
-    type: null,       // BUY or SELL
-    tokenAddress: null,
-    tokenSymbol: null,
-    tokenName: null,
-    amountSol: 0,
-    amountTokens: 0,
-    priceSol: 0,
-    rawData: tx,
+// ── Parse ─────────────────────────────────────────────────────
+function parseActivity(activity, walletAddress) {
+  const type = activity.event_type;
+  if (!type || !['buy', 'sell'].includes(type)) return null;
+
+  const tokenAddress = activity.token?.address;
+  if (!tokenAddress) return null;
+
+  const amountSol = parseFloat(activity.quote_amount) || 0;
+  const amountTokens = parseFloat(activity.token_amount) || 0;
+  const priceSol = parseFloat(activity.price) || 0;
+
+  return {
+    signature: activity.tx_hash || '',
+    timestamp: activity.timestamp
+      ? new Date(activity.timestamp * 1000).toISOString()
+      : new Date().toISOString(),
+    type: type.toUpperCase(),
+    tokenAddress,
+    tokenSymbol: activity.token?.symbol || 'UNKNOWN',
+    tokenName: activity.token?.name || '',
+    amountSol,
+    amountTokens,
+    priceSol,
+    dex: activity.launchpad_platform || activity.launchpad || 'unknown',
+    rawData: activity,
   };
-
-  // Method 1: Check if Helius classified it as a SWAP
-  if (tx.type === 'SWAP') {
-    // Parse native and token transfers
-    const nativeTransfers = tx.nativeTransfers || [];
-    const tokenTransfers = tx.tokenTransfers || [];
-
-    // SOL going OUT from wallet = buying tokens
-    // SOL coming IN to wallet = selling tokens
-
-    const solOut = nativeTransfers
-      .filter(t => t.fromUserAccount === walletAddress)
-      .reduce((sum, t) => sum + (t.amount || 0), 0);
-
-    const solIn = nativeTransfers
-      .filter(t => t.toUserAccount === walletAddress)
-      .reduce((sum, t) => sum + (t.amount || 0), 0);
-
-    // Find token transfers involving our wallet
-    const tokenIn = tokenTransfers.find(t => t.toUserAccount === walletAddress);
-    const tokenOut = tokenTransfers.find(t => t.fromUserAccount === walletAddress);
-
-    if (solOut > 0 && tokenIn) {
-      // BUYING tokens with SOL
-      result.type = 'BUY';
-      result.tokenAddress = tokenIn.mint;
-      result.amountSol = solOut / 1e9; // lamports to SOL
-      result.amountTokens = tokenIn.tokenAmount || 0;
-      if (result.amountTokens > 0) {
-        result.priceSol = result.amountSol / result.amountTokens;
-      }
-    } else if (solIn > 0 && tokenOut) {
-      // SELLING tokens for SOL
-      result.type = 'SELL';
-      result.tokenAddress = tokenOut.mint;
-      result.amountSol = solIn / 1e9;
-      result.amountTokens = tokenOut.tokenAmount || 0;
-      if (result.amountTokens > 0) {
-        result.priceSol = result.amountSol / result.amountTokens;
-      }
-    }
-
-    // Try to get token metadata from description or events
-    if (tx.description) {
-      const descMatch = tx.description.match(/(\w+)\s+(?:for|of)/i);
-      if (descMatch) result.tokenSymbol = descMatch[1];
-    }
-
-    if (tx.events?.swap) {
-      const swapEvent = tx.events.swap;
-      if (swapEvent.tokenIn && swapEvent.tokenOut) {
-        // Additional swap details
-        if (!result.tokenSymbol && swapEvent.tokenOut?.symbol) {
-          result.tokenSymbol = swapEvent.tokenOut.symbol;
-        }
-      }
-    }
-  }
-
-  // Method 2: Fallback - detect token transfers (for non-SWAP classified txns)
-  if (!result.type && tx.tokenTransfers) {
-    const relevant = tx.tokenTransfers.filter(
-      t => t.fromUserAccount === walletAddress || t.toUserAccount === walletAddress
-    );
-
-    for (const transfer of relevant) {
-      if (transfer.toUserAccount === walletAddress) {
-        // Receiving tokens - likely a buy (if SOL was sent)
-        result.type = 'BUY';
-        result.tokenAddress = transfer.mint;
-        result.amountTokens = transfer.tokenAmount || 0;
-      } else if (transfer.fromUserAccount === walletAddress) {
-        // Sending tokens - likely a sell (if SOL was received)
-        result.type = 'SELL';
-        result.tokenAddress = transfer.mint;
-        result.amountTokens = transfer.tokenAmount || 0;
-      }
-    }
-
-    // Check SOL movement to confirm
-    const solSpent = (tx.nativeTransfers || [])
-      .filter(t => t.fromUserAccount === walletAddress)
-      .reduce((sum, t) => sum + (t.amount || 0), 0);
-    const solReceived = (tx.nativeTransfers || [])
-      .filter(t => t.toUserAccount === walletAddress)
-      .reduce((sum, t) => sum + (t.amount || 0), 0);
-
-    if (result.type === 'BUY') {
-      result.amountSol = solSpent / 1e9;
-    } else if (result.type === 'SELL') {
-      result.amountSol = solReceived / 1e9;
-    }
-
-    if (result.amountTokens > 0 && result.amountSol > 0) {
-      result.priceSol = result.amountSol / result.amountTokens;
-    }
-  }
-
-  return result.type ? result : null;
 }
 
-/**
- * Enrich trade with token metadata (symbol, name)
- */
-async function enrichTokenInfo(tokenAddress) {
+// ── SOL Price ─────────────────────────────────────────────────
+let solPriceCache = { price: 0, ts: 0 };
+async function getSolPriceUsd() {
+  if (solPriceCache.price > 0 && Date.now() - solPriceCache.ts < 60000) {
+    return solPriceCache.price;
+  }
   try {
-    // Try Helius token metadata
-    if (HELIUS_API_KEY) {
-      const url = `${HELIUS_BASE}/token-metadata?api-key=${HELIUS_API_KEY}`;
-      const resp = await axios.post(url, { mintAccounts: [tokenAddress] }, { timeout: 5000 });
-      if (resp.data && resp.data[0]) {
-        const meta = resp.data[0];
-        return {
-          symbol: meta.symbol || 'UNKNOWN',
-          name: meta.name || '',
-        };
-      }
-    }
-  } catch (e) {
-    // Silently fail, use defaults
-  }
-  return { symbol: 'UNKNOWN', name: '' };
-}
-
-/**
- * Get current token price in SOL via Jupiter
- */
-async function getTokenPriceSol(tokenAddress) {
-  try {
-    const url = `https://api.jup.ag/price/v2?ids=${tokenAddress}`;
-    const resp = await axios.get(url, { timeout: 5000 });
-    const data = resp.data?.data?.[tokenAddress];
-    if (data?.price) {
-      // Jupiter returns price in USD, we need SOL price
-      // Get SOL price too
-      const solUrl = `https://api.jup.ag/price/v2?ids=So11111111111111111111111111111111111111112`;
-      const solResp = await axios.get(solUrl, { timeout: 5000 });
-      const solPrice = solResp.data?.data?.['So11111111111111111111111111111111111111112']?.price || 0;
-      if (solPrice > 0) {
-        return data.price / solPrice;
-      }
-    }
-  } catch (e) {
-    // Silently fail
-  }
-  return 0;
-}
-
-/**
- * Handle a detected trade - save to DB and update paper positions
- */
-async function handleTrade(trade) {
-  // Skip if no wallet address
-  if (!trade.walletAddress) return null;
-
-  // Enrich token info if unknown
-  if (!trade.tokenSymbol || trade.tokenSymbol === 'UNKNOWN') {
-    const info = await enrichTokenInfo(trade.tokenAddress);
-    trade.tokenSymbol = info.symbol;
-    trade.tokenName = info.name;
-  }
-
-  // Insert trade record
-  const stmt = db.prepare(`
-    INSERT INTO trades (wallet_address, token_address, token_symbol, token_name, action, amount_sol, amount_tokens, price_sol, detected_at, tx_signature, raw_data)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  stmt.run(
-    trade.walletAddress,
-    trade.tokenAddress,
-    trade.tokenSymbol,
-    trade.tokenName,
-    trade.type,
-    trade.amountSol,
-    trade.amountTokens,
-    trade.priceSol,
-    trade.timestamp,
-    trade.signature,
-    JSON.stringify(trade.rawData)
-  );
-
-  // Update paper positions
-  if (trade.type === 'BUY') {
-    // Open a new paper position
-    const posStmt = db.prepare(`
-      INSERT INTO paper_positions (wallet_address, token_address, token_symbol, buy_price_sol, buy_amount_sol, buy_amount_tokens, buy_time, status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN')
-    `);
-    posStmt.run(
-      trade.walletAddress,
-      trade.tokenAddress,
-      trade.tokenSymbol,
-      trade.priceSol,
-      trade.amountSol,
-      trade.amountTokens,
-      trade.timestamp
+    const axios = require('axios');
+    const { data } = await axios.get(
+      'https://api.jup.ag/price/v2?ids=So11111111111111111111111111111111111111112',
+      { timeout: 5000 }
     );
-    console.log(`📈 BUY signal: ${trade.tokenSymbol} @ ${trade.priceSol.toFixed(12)} SOL (${trade.amountSol.toFixed(4)} SOL) from ${trade.walletAddress.slice(0, 6)}...`);
+    const price = data?.data?.['So11111111111111111111111111111111111111112']?.price || 0;
+    if (price > 0) solPriceCache = { price, ts: Date.now() };
+    return price;
+  } catch (e) {
+    return 0;
   }
+}
 
-  if (trade.type === 'SELL') {
-    // Find matching open position and close it
-    const position = db.prepare(`
-      SELECT * FROM paper_positions
-      WHERE wallet_address = ? AND token_address = ? AND status = 'OPEN'
-      ORDER BY buy_time ASC LIMIT 1
-    `).get(trade.walletAddress, trade.tokenAddress);
-
-    if (position) {
-      const pnlSol = trade.amountSol - position.buy_amount_sol;
-      const pnlPercent = ((trade.priceSol - position.buy_price_sol) / position.buy_price_sol) * 100;
-
-      const updateStmt = db.prepare(`
-        UPDATE paper_positions
-        SET sell_price_sol = ?, sell_amount_sol = ?, sell_time = ?, pnl_sol = ?, pnl_percent = ?, status = 'CLOSED'
-        WHERE id = ?
-      `);
-      updateStmt.run(trade.priceSol, trade.amountSol, trade.timestamp, pnlSol, pnlPercent, position.id);
-
-      const emoji = pnlSol >= 0 ? '💰' : '📉';
-      console.log(`${emoji} SELL signal: ${trade.tokenSymbol} | PnL: ${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL (${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(1)}%) from ${trade.walletAddress.slice(0, 6)}...`);
-    } else {
-      console.log(`⚠️  SELL signal for ${trade.tokenSymbol} but no open position found`);
+async function enrichWithSolPrice(trade) {
+  if (trade.amountSol > 0 && trade.amountTokens > 0 && trade.priceSol <= 0) {
+    trade.priceSol = trade.amountSol / trade.amountTokens;
+  }
+  if (trade.amountSol <= 0 && trade.rawData?.cost_usd) {
+    const solPrice = await getSolPriceUsd();
+    if (solPrice > 0) {
+      trade.amountSol = trade.rawData.cost_usd / solPrice;
+      if (trade.amountTokens > 0) trade.priceSol = trade.amountSol / trade.amountTokens;
     }
   }
-
-  // Emit event for WebSocket broadcast
-  events.emit('trade', trade);
-
   return trade;
 }
 
-/**
- * Poll a single wallet for new transactions
- */
+// ── Handle Trade ──────────────────────────────────────────────
+async function handleTrade(trade) {
+  if (!trade.walletAddress) return null;
+  await enrichWithSolPrice(trade);
+
+  const stmt = db.prepare(`
+    INSERT INTO trades (wallet_address, token_address, token_symbol, token_name, action, amount_sol, amount_tokens, price_sol, detected_at, tx_signature, dex, raw_data)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  stmt.run(
+    trade.walletAddress, trade.tokenAddress, trade.tokenSymbol, trade.tokenName,
+    trade.type, trade.amountSol, trade.amountTokens, trade.priceSol,
+    trade.timestamp, trade.signature, trade.dex || 'unknown', JSON.stringify(trade.rawData)
+  );
+
+  if (trade.type === 'BUY') {
+    db.prepare(`INSERT INTO paper_positions (wallet_address, token_address, token_symbol, buy_price_sol, buy_amount_sol, buy_amount_tokens, buy_time, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN')`)
+      .run(trade.walletAddress, trade.tokenAddress, trade.tokenSymbol, trade.priceSol, trade.amountSol, trade.amountTokens, trade.timestamp);
+    const dexTag = trade.dex !== 'unknown' ? ` [${trade.dex}]` : '';
+    console.log(`📈 BUY: ${trade.tokenSymbol}${dexTag} @ ${trade.priceSol.toFixed(12)} SOL (${trade.amountSol.toFixed(4)} SOL) from ${trade.walletAddress.slice(0, 6)}...`);
+  }
+
+  if (trade.type === 'SELL') {
+    const position = db.prepare(`SELECT * FROM paper_positions WHERE wallet_address = ? AND token_address = ? AND status = 'OPEN' ORDER BY buy_time ASC LIMIT 1`)
+      .get(trade.walletAddress, trade.tokenAddress);
+    if (position) {
+      const pnlSol = trade.amountSol - position.buy_amount_sol;
+      const pnlPercent = position.buy_price_sol > 0 ? ((trade.priceSol - position.buy_price_sol) / position.buy_price_sol) * 100 : 0;
+      db.prepare(`UPDATE paper_positions SET sell_price_sol = ?, sell_amount_sol = ?, sell_time = ?, pnl_sol = ?, pnl_percent = ?, status = 'CLOSED' WHERE id = ?`)
+        .run(trade.priceSol, trade.amountSol, trade.timestamp, pnlSol, pnlPercent, position.id);
+      const emoji = pnlSol >= 0 ? '💰' : '📉';
+      const dexTag = trade.dex !== 'unknown' ? ` [${trade.dex}]` : '';
+      console.log(`${emoji} SELL: ${trade.tokenSymbol}${dexTag} | PnL: ${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL (${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(1)}%) from ${trade.walletAddress.slice(0, 6)}...`);
+    } else {
+      console.log(`⚠️  SELL: ${trade.tokenSymbol} but no open position`);
+    }
+  }
+
+  events.emit('trade', trade);
+  return trade;
+}
+
+// ── Poll Wallet (with rate limiting) ──────────────────────────
 async function pollWallet(walletAddress) {
   try {
-    const txns = await fetchWalletTransactions(walletAddress, 5);
+    await waitForToken(3); // weight=3
+
+    const result = await fetchWalletActivity(walletAddress, 20);
+    const activities = result?.activities || [];
     const lastSig = lastSeenTx.get(walletAddress);
 
-    let newTxns = [];
-    for (const tx of txns) {
-      if (tx.signature === lastSig) break;
-      newTxns.push(tx);
+    let newActivities = [];
+    for (const act of activities) {
+      if (act.tx_hash === lastSig) break;
+      newActivities.push(act);
     }
 
-    if (newTxns.length > 0) {
-      lastSeenTx.set(walletAddress, newTxns[0].signature);
-
-      // Process newest first (they come newest-first from API)
-      for (const tx of newTxns.reverse()) {
-        const swap = parseSwapTransaction(tx, walletAddress);
-        if (swap) {
-          await handleTrade(swap);
-        }
+    if (newActivities.length > 0) {
+      lastSeenTx.set(walletAddress, newActivities[0].tx_hash);
+      for (const act of newActivities.reverse()) {
+        const trade = parseActivity(act, walletAddress);
+        if (trade) await handleTrade(trade);
       }
     }
   } catch (err) {
-    console.error(`Error polling wallet ${walletAddress.slice(0, 8)}...: ${err.message}`);
+    if (err.message?.includes('429')) {
+      // Rate limited — back off
+      bucket.tokens = 0;
+      await new Promise(r => setTimeout(r, 5000));
+    } else {
+      console.error(`Error polling ${walletAddress.slice(0, 8)}: ${err.message}`);
+    }
   }
 }
 
-/**
- * Main monitoring loop
- */
+// ── Monitor Loop ──────────────────────────────────────────────
 let monitorInterval = null;
 let isRunning = false;
 let pollIndex = 0;
@@ -317,9 +193,8 @@ async function monitorTick() {
   const wallets = db.prepare('SELECT address FROM tracked_wallets WHERE active = 1').all();
   if (wallets.length === 0) return;
 
-  // Poll only 3 wallets per tick (rotate through them)
-  // With 5s interval and 3 wallets per tick, we poll each wallet every 50s
-  const batchSize = 3;
+  // Poll 6 wallets per tick (weight 3 × 6 = 18, under 20 capacity)
+  const batchSize = 6;
   const start = pollIndex % wallets.length;
   const batch = [];
   for (let i = 0; i < batchSize && i < wallets.length; i++) {
@@ -327,37 +202,44 @@ async function monitorTick() {
   }
   pollIndex += batchSize;
 
-  for (const w of batch) {
-    await pollWallet(w.address);
-    await new Promise(r => setTimeout(r, 500)); // 500ms delay between each
-  }
+  const now = new Date().toLocaleTimeString();
+  console.log(`[${now}] Polling ${batch.map(w => w.address.slice(0,6)).join(', ')}...`);
+
+  await Promise.allSettled(batch.map(w => pollWallet(w.address)));
 }
 
 function startMonitor() {
   if (isRunning) return;
   isRunning = true;
-  console.log(`🔍 Starting wallet monitor (batch polling, 3 wallets per tick)`);
+  console.log(`🔍 Starting GMGN monitor (6 per tick, ${POLL_INTERVAL}ms interval, rate-limited)`);
 
-  // Seed wallets slowly to avoid rate limits
+  if (gmgnKeys.length === 0) {
+    console.log('⚠️  No GMGN_API_KEYS set.');
+    isRunning = false;
+    return;
+  }
+
+  // Seed wallets with rate limiting
   (async () => {
     const wallets = db.prepare('SELECT address FROM tracked_wallets WHERE active = 1').all();
-    console.log(`  Seeding ${wallets.length} wallets (with delays)...`);
+    console.log(`  Seeding ${wallets.length} wallets...`);
     for (const w of wallets) {
       try {
-        const txns = await fetchWalletTransactions(w.address, 1);
-        if (txns.length > 0) {
-          lastSeenTx.set(w.address, txns[0].signature);
+        await waitForToken(3);
+        const result = await fetchWalletActivity(w.address, 1);
+        const activities = result?.activities || [];
+        if (activities.length > 0) {
+          lastSeenTx.set(w.address, activities[0].tx_hash);
           console.log(`  ✓ ${w.address.slice(0, 8)}...`);
         }
       } catch (e) {
         console.error(`  ✗ ${w.address.slice(0, 8)}... ${e.message}`);
       }
-      await new Promise(r => setTimeout(r, 1000)); // 1s between each seed
     }
-    console.log('✅ Monitor ready. Watching for new trades...\n');
+    console.log('✅ Monitor ready. Watching for trades...\n');
   })();
 
-  monitorInterval = setInterval(monitorTick, 5000);
+  monitorInterval = setInterval(monitorTick, POLL_INTERVAL);
 }
 
 function stopMonitor() {
@@ -375,6 +257,7 @@ function getMonitorStatus() {
     pollInterval: POLL_INTERVAL,
     walletsTracked: lastSeenTx.size,
     lastSeen: Object.fromEntries(lastSeenTx),
+    source: 'gmgn',
   };
 }
 

@@ -1,7 +1,7 @@
 /**
  * Live Trade Executor
  * 
- * Executes copy-trades with Jito MEV protection.
+ * Executes copy-trades with GMGN swap API + Jito MEV protection.
  * Paper trading mode: logs trades without executing.
  * Live mode: sends real transactions via Jito bundles.
  */

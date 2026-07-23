@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Whale Tracker — Memecoin Paper Trading</title>
+  <title>Whale Tracker — GMGN Memecoin Paper Trading</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <style>
@@ -701,7 +701,7 @@
     <div class="topbar-left">
       <div class="logo">
         <div class="logo-icon">🎯</div>
-        Whale Tracker
+        Whale Tracker <span style="font-size:10px;color:var(--text-2);font-weight:500;margin-left:4px">GMGN</span>
       </div>
     </div>
     <div class="topbar-center">
@@ -793,6 +793,7 @@
                 <th>Wallet</th>
                 <th>Action</th>
                 <th>Token</th>
+                <th>DEX</th>
                 <th>Price (SOL)</th>
                 <th>Amount</th>
                 <th>Total SOL</th>
@@ -999,6 +1000,7 @@
             <span class="token-name">${t.token_symbol || 'UNKNOWN'}</span>
           </div>
         </td>
+        <td><span class="badge" style="background:${t.dex==='pump.fun'?'var(--purple);color:#fff':'var(--bg-4);color:var(--text-2)'};border:1px solid ${t.dex==='pump.fun'?'var(--purple)':'var(--border-light)'}">${t.dex||'unknown'}</span></td>
         <td class="mono">${fmtPrice(t.price_sol)}</td>
         <td class="mono">${fmtNum(t.amount_tokens)}</td>
         <td class="mono" style="font-weight:600">${t.amount_sol?.toFixed(4)}</td>

@@ -30,6 +30,7 @@ db.exec(`
     liquidity REAL DEFAULT 0,
     detected_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     tx_signature TEXT DEFAULT '',
+    dex TEXT DEFAULT 'unknown',
     raw_data TEXT DEFAULT '{}'
   );
 
@@ -56,5 +57,12 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_positions_status ON paper_positions(status);
   CREATE INDEX IF NOT EXISTS idx_positions_wallet ON paper_positions(wallet_address);
 `);
+
+// Migration: add dex column if missing
+try {
+  db.prepare('SELECT dex FROM trades LIMIT 1').get();
+} catch (e) {
+  db.exec("ALTER TABLE trades ADD COLUMN dex TEXT DEFAULT 'unknown'");
+}
 
 module.exports = db;

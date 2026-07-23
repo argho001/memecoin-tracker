@@ -7,10 +7,16 @@ const path = require('path');
 const db = require('./db');
 const { startMonitor, stopMonitor, getMonitorStatus, events: monitorEvents } = require('./monitor');
 const { TradeExecutor } = require('./executor');
+const { GmgnClient } = require('./gmgn');
+
+// Initialize GMGN client
+const GMGN_API_KEYS = process.env.GMGN_API_KEYS || process.env.GMGN_API_KEY || '';
+const gmgnKeys = GMGN_API_KEYS.split(',').map(k => k.trim()).filter(Boolean);
+const gmgn = new GmgnClient(gmgnKeys);
 
 // Initialize executor (paper mode by default)
 const executor = new TradeExecutor({
-  mode: 'paper', // 'paper' or 'live'
+  mode: 'paper',
   maxPositionSol: 1.0,
   slippageBps: 100,
   stopLossPercent: 50,
@@ -24,148 +30,10 @@ const wss = new WebSocket.Server({ server });
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ─── Helius Webhook Receiver ──────────────────────────────────
-app.post('/api/webhook', async (req, res) => {
-  const events = Array.isArray(req.body) ? req.body : [req.body];
-
-  for (const event of events) {
-    try {
-      await processWebhookEvent(event);
-    } catch (e) {
-      console.error('Webhook error:', e.message);
-    }
-  }
-
-  res.status(200).json({ ok: true });
+// Health check for Railway
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', uptime: process.uptime() });
 });
-
-async function processWebhookEvent(tx) {
-  if (!tx || !tx.signature) return;
-
-  const walletAddress = tx.feePayer || '';
-  if (!walletAddress) return;
-
-  // Check if this wallet is tracked
-  const tracked = db.prepare('SELECT * FROM tracked_wallets WHERE address = ? AND active = 1').get(walletAddress);
-  if (!tracked) return;
-
-  // Parse swap
-  const swap = parseSwapFromWebhook(tx, walletAddress);
-  if (!swap) return;
-
-  // FILTER: Skip dust trades (minimum 0.05 SOL)
-  if (swap.amountSol < 0.05) return;
-
-  // Save trade
-  const stmt = db.prepare(`
-    INSERT INTO trades (wallet_address, token_address, token_symbol, token_name, action, amount_sol, amount_tokens, price_sol, detected_at, tx_signature, raw_data)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  stmt.run(
-    swap.walletAddress,
-    swap.tokenAddress,
-    swap.tokenSymbol || 'UNKNOWN',
-    swap.tokenName || '',
-    swap.type,
-    swap.amountSol,
-    swap.amountTokens,
-    swap.priceSol,
-    swap.timestamp,
-    swap.signature,
-    JSON.stringify(tx)
-  );
-
-  // Update paper positions
-  if (swap.type === 'BUY') {
-    db.prepare(`
-      INSERT INTO paper_positions (wallet_address, token_address, token_symbol, buy_price_sol, buy_amount_sol, buy_amount_tokens, buy_time, status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN')
-    `).run(swap.walletAddress, swap.tokenAddress, swap.tokenSymbol || 'UNKNOWN', swap.priceSol, swap.amountSol, swap.amountTokens, swap.timestamp);
-
-    console.log(`📈 BUY: ${swap.tokenSymbol} @ ${swap.priceSol.toFixed(10)} SOL (${swap.amountSol.toFixed(4)} SOL) from ${walletAddress.slice(0, 8)}...`);
-  }
-
-  if (swap.type === 'SELL') {
-    const position = db.prepare(`
-      SELECT * FROM paper_positions
-      WHERE wallet_address = ? AND token_address = ? AND status = 'OPEN'
-      ORDER BY buy_time ASC LIMIT 1
-    `).get(swap.walletAddress, swap.tokenAddress);
-
-    if (position) {
-      const pnlSol = swap.amountSol - position.buy_amount_sol;
-      const pnlPercent = position.buy_price_sol > 0 ? ((swap.priceSol - position.buy_price_sol) / position.buy_price_sol) * 100 : 0;
-
-      db.prepare(`
-        UPDATE paper_positions
-        SET sell_price_sol = ?, sell_amount_sol = ?, sell_time = ?, pnl_sol = ?, pnl_percent = ?, status = 'CLOSED'
-        WHERE id = ?
-      `).run(swap.priceSol, swap.amountSol, swap.timestamp, pnlSol, pnlPercent, position.id);
-
-      const emoji = pnlSol >= 0 ? '💰' : '📉';
-      console.log(`${emoji} SELL: ${swap.tokenSymbol} | PnL: ${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL (${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(1)}%)`);
-    }
-  }
-
-  // Execute trade (paper or live)
-  const result = await executor.processTrade(swap);
-  if (result) {
-    swap.executionResult = result;
-  }
-
-  // Broadcast to dashboard
-  broadcast('NEW_TRADE', swap);
-}
-
-function parseSwapFromWebhook(tx, walletAddress) {
-  const result = {
-    signature: tx.signature,
-    timestamp: tx.timestamp ? new Date(tx.timestamp * 1000).toISOString() : new Date().toISOString(),
-    type: null,
-    tokenAddress: null,
-    tokenSymbol: null,
-    tokenName: null,
-    amountSol: 0,
-    amountTokens: 0,
-    priceSol: 0,
-    walletAddress,
-  };
-
-  if (tx.type === 'SWAP') {
-    const solOut = (tx.nativeTransfers || [])
-      .filter(t => t.fromUserAccount === walletAddress)
-      .reduce((sum, t) => sum + (t.amount || 0), 0) / 1e9;
-
-    const solIn = (tx.nativeTransfers || [])
-      .filter(t => t.toUserAccount === walletAddress)
-      .reduce((sum, t) => sum + (t.amount || 0), 0) / 1e9;
-
-    const tokenIn = (tx.tokenTransfers || []).find(t => t.toUserAccount === walletAddress);
-    const tokenOut = (tx.tokenTransfers || []).find(t => t.fromUserAccount === walletAddress);
-
-    if (solOut > 0 && tokenIn) {
-      result.type = 'BUY';
-      result.tokenAddress = tokenIn.mint;
-      result.amountSol = solOut;
-      result.amountTokens = tokenIn.tokenAmount || 0;
-      if (result.amountTokens > 0) result.priceSol = result.amountSol / result.amountTokens;
-    } else if (solIn > 0 && tokenOut) {
-      result.type = 'SELL';
-      result.tokenAddress = tokenOut.mint;
-      result.amountSol = solIn;
-      result.amountTokens = tokenOut.tokenAmount || 0;
-      if (result.amountTokens > 0) result.priceSol = result.amountSol / result.amountTokens;
-    }
-
-    if (tx.description) {
-      const match = tx.description.match(/(\w+)\s+(?:for|of)/i);
-      if (match) result.tokenSymbol = match[1];
-    }
-  }
-
-  return result.type ? result : null;
-}
 
 // ─── WebSocket for live updates ────────────────────────────────
 const wsClients = new Set();
@@ -184,7 +52,6 @@ function broadcast(type, data) {
   }
 }
 
-// Listen for monitor trade events and broadcast via WebSocket
 monitorEvents.on('trade', (trade) => {
   broadcast('NEW_TRADE', trade);
 });
@@ -232,12 +99,13 @@ app.patch('/api/wallets/:id', (req, res) => {
 
 // --- Trades ---
 app.get('/api/trades', (req, res) => {
-  const { wallet, token, limit = 100, offset = 0 } = req.query;
+  const { wallet, token, dex, limit = 100, offset = 0 } = req.query;
   let sql = 'SELECT * FROM trades WHERE 1=1';
   const params = [];
 
   if (wallet) { sql += ' AND wallet_address = ?'; params.push(wallet); }
   if (token) { sql += ' AND token_address = ?'; params.push(token); }
+  if (dex) { sql += ' AND dex = ?'; params.push(dex); }
 
   sql += ' ORDER BY detected_at DESC LIMIT ? OFFSET ?';
   params.push(parseInt(limit), parseInt(offset));
@@ -284,7 +152,6 @@ app.get('/api/stats', (req, res) => {
 
   const winRate = closedPositions > 0 ? (pnlStats.winning_trades / closedPositions) * 100 : 0;
 
-  // Per-wallet stats
   const walletStats = db.prepare(`
     SELECT
       wallet_address,
@@ -299,7 +166,6 @@ app.get('/api/stats', (req, res) => {
     ORDER BY total_pnl DESC
   `).all();
 
-  // Top tokens
   const topTokens = db.prepare(`
     SELECT
       token_symbol,
@@ -355,11 +221,13 @@ app.get('/api/monitor/status', (req, res) => {
 // --- Settings ---
 app.get('/api/settings', (req, res) => {
   res.json({
-    hasHeliusKey: !!process.env.HELIUS_API_KEY,
+    hasApiKey: gmgnKeys.length > 0,
+    keyCount: gmgnKeys.length,
     pollInterval: parseInt(process.env.POLL_INTERVAL_MS) || 5000,
     defaultPositionSol: parseFloat(process.env.DEFAULT_POSITION_SOL) || 1.0,
     stopLoss: parseInt(process.env.STOP_LOSS_PERCENT) || 50,
     takeProfit: parseInt(process.env.TAKE_PROFIT_PERCENT) || 500,
+    source: 'gmgn',
   });
 });
 
@@ -394,7 +262,49 @@ app.post('/api/executor/config', (req, res) => {
   res.json(executor.getStatus());
 });
 
-// --- Seed demo data (for testing without API key) ---
+// --- GMGN: Wallet Stats ---
+app.get('/api/gmgn/wallet-stats/:address', async (req, res) => {
+  try {
+    const stats = await gmgn.getWalletStats(req.params.address, req.query.period || '7d');
+    res.json(stats);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- GMGN: Wallet Holdings ---
+app.get('/api/gmgn/holdings/:address', async (req, res) => {
+  try {
+    const holdings = await gmgn.getWalletHoldings(req.params.address);
+    res.json(holdings);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- GMGN: Trending Tokens ---
+app.get('/api/gmgn/trending', async (req, res) => {
+  try {
+    const tokens = await gmgn.getTrending(req.query.interval || '1h', {
+      limit: parseInt(req.query.limit) || 50,
+    });
+    res.json(tokens);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- GMGN: Token Signals ---
+app.get('/api/gmgn/signals', async (req, res) => {
+  try {
+    const signals = await gmgn.getTokenSignals();
+    res.json(signals);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- Seed demo data ---
 app.post('/api/demo/seed', (req, res) => {
   const demoWallets = [
     { address: '7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU', label: 'Whale #1' },
@@ -407,19 +317,18 @@ app.post('/api/demo/seed', (req, res) => {
     insertWallet.run(w.address, w.label);
   }
 
-  // Generate demo trades
   const demoTokens = [
-    { symbol: 'BONK', name: 'Bonk', address: 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263' },
-    { symbol: 'WIF', name: 'dogwifhat', address: 'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm' },
-    { symbol: 'POPCAT', name: 'Popcat', address: '7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr' },
-    { symbol: 'MEW', name: 'cat in a worlds dog', address: 'MEW1gQWJ3nEXg2qgERiKu7FAFj79yvzG49Td4Mbpump' },
-    { symbol: 'GUMMY', name: 'GUMMY', address: 'GUMMYbJNd1qi4EuiRdx8sW6a2YdWJHQjwjN8MFqZT54G' },
-    { symbol: 'MYRO', name: 'Myro', address: 'HhJpBhRRn4g56VsyLuT8DL5Bv31HkXqsrahTTUCZeZg4' },
+    { symbol: 'BONK', name: 'Bonk', address: 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', dex: 'raydium' },
+    { symbol: 'WIF', name: 'dogwifhat', address: 'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm', dex: 'jupiter' },
+    { symbol: 'POPCAT', name: 'Popcat', address: '7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr', dex: 'raydium' },
+    { symbol: 'MEW', name: 'cat in a worlds dog', address: 'MEW1gQWJ3nEXg2qgERiKu7FAFj79yvzG49Td4Mbpump', dex: 'pump.fun' },
+    { symbol: 'GUMMY', name: 'GUMMY', address: 'GUMMYbJNd1qi4EuiRdx8sW6a2YdWJHQjwjN8MFqZT54G', dex: 'pump.fun' },
+    { symbol: 'MYRO', name: 'Myro', address: 'HhJpBhRRn4g56VsyLuT8DL5Bv31HkXqsrahTTUCZeZg4', dex: 'jupiter' },
   ];
 
   const insertTrade = db.prepare(`
-    INSERT INTO trades (wallet_address, token_address, token_symbol, token_name, action, amount_sol, amount_tokens, price_sol, detected_at, tx_signature)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO trades (wallet_address, token_address, token_symbol, token_name, action, amount_sol, amount_tokens, price_sol, detected_at, tx_signature, dex)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   const insertPosition = db.prepare(`
@@ -427,7 +336,6 @@ app.post('/api/demo/seed', (req, res) => {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
-  // Generate realistic demo data
   const now = Date.now();
   let sigCounter = 0;
 
@@ -444,10 +352,9 @@ app.post('/api/demo/seed', (req, res) => {
 
     insertTrade.run(
       wallet.address, token.address, token.symbol, token.name, 'BUY',
-      buyAmountSol, buyAmountTokens, buyPrice, buyTime, sig
+      buyAmountSol, buyAmountTokens, buyPrice, buyTime, sig, token.dex
     );
 
-    // 70% chance already sold
     if (Math.random() > 0.3) {
       const pnlMult = Math.random() > 0.35 ? (1 + Math.random() * 8) : (0.1 + Math.random() * 0.6);
       const sellPrice = buyPrice * pnlMult;
@@ -462,7 +369,7 @@ app.post('/api/demo/seed', (req, res) => {
 
       insertTrade.run(
         wallet.address, token.address, token.symbol, token.name, 'SELL',
-        sellAmountSol, sellAmountTokens, sellPrice, sellTime, sellSig
+        sellAmountSol, sellAmountTokens, sellPrice, sellTime, sellSig, token.dex
       );
 
       insertPosition.run(
@@ -486,17 +393,18 @@ app.post('/api/demo/seed', (req, res) => {
 // ─── Start Server ──────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 
-server.listen(PORT, () => {
-  console.log(`\n🚀 Memecoin Paper Trading Dashboard`);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`\n🚀 Memecoin Paper Trading Dashboard — GMGN Edition`);
   console.log(`   http://localhost:${PORT}`);
   console.log(`   API: http://localhost:${PORT}/api/stats`);
   console.log('');
 
-  // Auto-start monitor if API key is set
-  if (process.env.HELIUS_API_KEY) {
+  if (gmgnKeys.length > 0) {
     startMonitor();
   } else {
-    console.log('⚠️  No HELIUS_API_KEY set. Run with API key for live monitoring.');
+    console.log('⚠️  No GMGN_API_KEY set.');
+    console.log('   Get your key at https://gmgn.ai/ai');
+    console.log('   Set it in .env as GMGN_API_KEY=your_key');
     console.log('   Visit dashboard and click "Seed Demo Data" to explore.\n');
   }
 });
